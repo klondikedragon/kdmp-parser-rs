@@ -1,6 +1,6 @@
 // Axel '0vercl0k' Souchet - November 11 2025
 use core::slice;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use crate::error::{Error, Result};
@@ -57,6 +57,10 @@ fn try_read_unicode_string(
 /// value is a path to the module or it's name if no path is available.
 pub type ModuleMap = HashMap<Range<Gva>, String>;
 
+/// Upper bound on the entries walked in one module list. Real lists hold a few
+/// hundred entries; a corrupted list can be cyclic without returning to the head.
+const MAX_MODULE_LIST_ENTRIES: usize = 0x1_0000;
+
 /// Walk a `LIST_ENTRY` of `LdrDataTableEntry`. It is used to dump both the user
 /// & driver / module lists.
 fn try_read_module_map<P: Pod + HasCheckedAdd>(
@@ -69,8 +73,15 @@ fn try_read_module_map<P: Pod + HasCheckedAdd>(
     };
 
     let mut entry_addr = Gva::new(entry.flink.into());
+    let mut visited = HashSet::new();
     // We'll walk it until we hit the starting point (it is circular).
     while entry_addr != head {
+        // A corrupted list can loop without coming back to the head; treat it like an
+        // unreadable entry.
+        if !visited.insert(entry_addr) || visited.len() > MAX_MODULE_LIST_ENTRIES {
+            return Ok(None);
+        }
+
         // Read the table entry..
         let Some(data) = reader.try_read_struct::<LdrDataTableEntry<P>>(entry_addr)? else {
             return Ok(None);

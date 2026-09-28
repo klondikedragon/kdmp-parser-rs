@@ -955,3 +955,26 @@ fn header_counts_checked_against_file_length() {
         }
     }
 }
+
+#[test]
+fn cyclic_module_list_is_dropped() {
+    // Point the first loaded-module entry at itself so the walk never reaches the
+    // list head again.
+    let data = std::fs::read(BMP_PATH.as_path()).unwrap();
+    let parser = KernelDumpParser::with_reader(std::io::Cursor::new(data.clone())).unwrap();
+    let virt_reader = virt::Reader::new(&parser);
+    let head = Gva::new(parser.headers().ps_loaded_module_list);
+    let first = virt_reader.read_struct::<u64>(head).unwrap();
+    let gpa = virt_reader.translate(Gva::new(first)).unwrap().gpa();
+    let std::io::SeekFrom::Start(offset) = phys::Reader::new(&parser).translate(gpa).unwrap()
+    else {
+        unreachable!()
+    };
+    let offset = usize::try_from(offset).unwrap();
+    let mut bad = data;
+    bad[offset..offset + 8].copy_from_slice(&first.to_le_bytes());
+
+    // The parse succeeds and the module list is simply absent.
+    let parser = KernelDumpParser::with_reader(std::io::Cursor::new(bad)).unwrap();
+    assert_eq!(parser.kernel_modules().len(), 0);
+}
