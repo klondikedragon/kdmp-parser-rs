@@ -92,6 +92,31 @@ impl Builder {
         }
     }
 
+    /// Records `pages` consecutive pages starting at `gpa` whose contents are
+    /// stored back to back from `file_offset`. Returns `false` if the eager
+    /// map already had one of them.
+    pub fn push_run(&mut self, gpa: Gpa, pages: u64, file_offset: u64) -> bool {
+        if pages == 0 {
+            return true;
+        }
+
+        match self.strategy {
+            PhysIndexStrategy::Eager => {
+                let size = PageKind::Normal.size();
+                (0..pages)
+                    .all(|i| self.push(Gpa::new(gpa.u64() + i * size), file_offset + i * size))
+            }
+            PhysIndexStrategy::Compact => {
+                self.push(gpa, file_offset);
+                let last = self.runs.last_mut().unwrap();
+                last.pages += pages - 1;
+                self.pages += pages - 1;
+
+                true
+            }
+        }
+    }
+
     /// Finalizes the index. Overlapping runs are reported like duplicate
     /// pages in the eager map.
     pub fn finish(mut self) -> Result<PhysIndex> {

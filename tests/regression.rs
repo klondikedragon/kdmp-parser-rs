@@ -880,3 +880,78 @@ fn physmem_strategies_agree() {
         assert!(compact_reader.translate(Gpa::new(!0xfff)).is_err());
     }
 }
+
+/// Builds a dump from the first page of a real dump with a different dump type
+/// and whatever follows the header.
+fn synthetic_dump(dump_type: u32, patch: impl Fn(&mut [u8]), tail: &[u8]) -> Vec<u8> {
+    let mut data = std::fs::read(BMP_PATH.as_path()).unwrap();
+    data.truncate(0x2_000);
+    data[0xf98..0xf9c].copy_from_slice(&dump_type.to_le_bytes());
+    patch(&mut data);
+    data.extend_from_slice(tail);
+
+    data
+}
+
+#[test]
+fn header_counts_checked_against_file_length() {
+    let bmp_header = |pages: u64, first_page: u64| {
+        let mut h = vec![0u8; 0x38];
+        h[0..4].copy_from_slice(b"SDMP");
+        h[4..8].copy_from_slice(b"DUMP");
+        h[0x20..0x28].copy_from_slice(&first_page.to_le_bytes());
+        h[0x28..0x30].copy_from_slice(&pages.to_le_bytes());
+        h[0x30..0x38].copy_from_slice(&pages.to_le_bytes());
+        h
+    };
+    let cases = [
+        // Full dump whose single run declares 2^36 pages.
+        synthetic_dump(
+            1,
+            |d| {
+                d[0x88..0x8c].copy_from_slice(&1u32.to_le_bytes());
+                d[0x90..0x98].copy_from_slice(&(1u64 << 36).to_le_bytes());
+                d[0x98..0xa0].copy_from_slice(&0u64.to_le_bytes());
+                d[0xa0..0xa8].copy_from_slice(&(1u64 << 36).to_le_bytes());
+            },
+            &[0; 0x1_000],
+        ),
+        // Bitmap dump marking 8M pages present with no page data behind it.
+        synthetic_dump(
+            5,
+            |_| {},
+            &[
+                bmp_header(8 << 20, 0x2_038 + (1 << 20)),
+                vec![0xff; 1 << 20],
+            ]
+            .concat(),
+        ),
+        // Bitmap dump declaring 2^40 pages in a short file.
+        synthetic_dump(
+            5,
+            |_| {},
+            &[bmp_header(1 << 40, 0x3_000), vec![0xff; 0x1_000]].concat(),
+        ),
+        // Kernel dump with a range of 2^36 pages.
+        synthetic_dump(8, |_| {}, &{
+            let mut r = vec![0u8; 0x1_000];
+            r[0..4].copy_from_slice(&0x40u32.to_le_bytes());
+            r[4..8].copy_from_slice(b"RDMP");
+            r[8..12].copy_from_slice(b"DUMP");
+            r[0x10..0x18].copy_from_slice(&0x30u64.to_le_bytes());
+            r[0x18..0x20].copy_from_slice(&0x2_050u64.to_le_bytes());
+            r[0x30..0x38].copy_from_slice(&1u64.to_le_bytes());
+            r[0x38..0x40].copy_from_slice(&(1u64 << 36).to_le_bytes());
+            r
+        }),
+    ];
+    for (i, data) in cases.iter().enumerate() {
+        for strategy in [PhysIndexStrategy::Eager, PhysIndexStrategy::Compact] {
+            let res = KernelDumpParser::with_reader_and_strategy(
+                std::io::Cursor::new(data.clone()),
+                strategy,
+            );
+            assert!(res.is_err(), "case {i} {strategy:?}");
+        }
+    }
+}

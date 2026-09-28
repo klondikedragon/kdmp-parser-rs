@@ -42,6 +42,29 @@ fn gpa_from_pfn_range(pfn_range: &PfnRange, page_idx: u64) -> Option<Gpa> {
     Some(Pfn::new(pfn_range.page_file_number).gpa_with_offset(offset))
 }
 
+/// Total length of the reader, leaving its position unchanged.
+fn reader_len(reader: &mut impl Reader) -> Result<u64> {
+    let pos = reader.stream_position()?;
+    let len = reader.seek(io::SeekFrom::End(0))?;
+    reader.seek(io::SeekFrom::Start(pos))?;
+
+    Ok(len)
+}
+
+/// Checks that `pages` pages stored from `file_offset` fit in a reader of
+/// `len` bytes.
+fn check_pages_fit(file_offset: u64, pages: u64, len: u64) -> Result<()> {
+    let end = pages
+        .checked_mul(PageKind::Normal.size())
+        .and_then(|size| file_offset.checked_add(size))
+        .ok_or(Error::Overflow("page range"))?;
+    if end > len {
+        return Err(Error::InvalidData("pages extend past the end of the file"));
+    }
+
+    Ok(())
+}
+
 /// Read a `T` from the cursor.
 fn read_struct<T: Pod>(reader: &mut impl Reader) -> Result<T> {
     let mut s: MaybeUninit<T> = MaybeUninit::uninit();
@@ -250,29 +273,39 @@ impl KernelDumpParser {
         reader: &mut impl Reader,
         strategy: PhysIndexStrategy,
     ) -> Result<PhysIndex> {
+        let len = reader_len(reader)?;
         let mut page_offset = reader.stream_position()?;
         let mut run_cursor = io::Cursor::new(headers.physical_memory_block_buffer);
         let physmem_desc = read_struct::<PhysmemDesc>(&mut run_cursor)?;
+        let max_runs = (headers.physical_memory_block_buffer.len() - mem::size_of::<PhysmemDesc>())
+            / mem::size_of::<PhysmemRun>();
+        if usize::try_from(physmem_desc.number_of_runs).map_or(true, |n| n > max_runs) {
+            return Err(Error::InvalidData("too many physical memory runs"));
+        }
+
         let mut physmem = Builder::new(strategy);
 
         for run_idx in 0..physmem_desc.number_of_runs {
             let run = read_struct::<PhysmemRun>(&mut run_cursor)?;
-            for page_idx in 0..run.page_count {
-                // Calculate the physical address.
-                let phys_addr = run
-                    .phys_addr(page_idx)
-                    .ok_or(Error::PhysAddrOverflow(run_idx, page_idx))?;
-
-                // We now know where this page lives at, insert it into the physmem map.
-                if !physmem.push(phys_addr, page_offset) {
-                    return Err(Error::DuplicateGpa(phys_addr));
-                }
-
-                // Move the page offset along.
-                page_offset = page_offset
-                    .checked_add(PageKind::Normal.size())
-                    .ok_or(Error::PageOffsetOverflow(run_idx, page_idx))?;
+            if run.page_count == 0 {
+                continue;
             }
+
+            // Calculate the physical addresses of the first and last pages.
+            let phys_addr = run
+                .phys_addr(0)
+                .ok_or(Error::PhysAddrOverflow(run_idx, 0))?;
+            run.phys_addr(run.page_count - 1)
+                .ok_or(Error::PhysAddrOverflow(run_idx, run.page_count - 1))?;
+
+            // The run's pages must be in the file before they go in the index.
+            check_pages_fit(page_offset, run.page_count, len)?;
+            if !physmem.push_run(phys_addr, run.page_count, page_offset) {
+                return Err(Error::DuplicateGpa(phys_addr));
+            }
+
+            // Move the page offset along.
+            page_offset += run.page_count * PageKind::Normal.size();
         }
 
         physmem.finish()
@@ -288,6 +321,16 @@ impl KernelDumpParser {
         let remaining_bits = bmp_header.pages % 8;
         let bitmap_size = bmp_header.pages.div_ceil(8);
         let mut page_offset = bmp_header.first_page;
+        let len = reader_len(reader)?;
+        if reader
+            .stream_position()?
+            .checked_add(bitmap_size)
+            .is_none_or(|end| end > len)
+        {
+            return Err(Error::InvalidData(
+                "bitmap extends past the end of the file",
+            ));
+        }
         if strategy == PhysIndexStrategy::Compact {
             // Keep the bitmap, with a rank table, as the index. Read it in chunks so the
             // allocation follows the bytes actually present in the file.
@@ -305,7 +348,10 @@ impl KernelDumpParser {
             {
                 *last &= (1u8 << remaining_bits).wrapping_sub(1);
             }
-            return Ok(PhysIndex::bitmap(page_offset, bits));
+            let index = PhysIndex::bitmap(page_offset, bits);
+            check_pages_fit(page_offset, index.len() as u64, len)?;
+
+            return Ok(index);
         }
         let mut physmem = PhysmemMap::new();
 
@@ -333,6 +379,7 @@ impl KernelDumpParser {
                 let pa =
                     gpa_from_bitmap(bitmap_idx, bit_idx).ok_or(Error::Overflow("pfn in bitmap"))?;
 
+                check_pages_fit(page_offset, 1, len)?;
                 let insert = physmem.insert(pa, page_offset);
                 debug_assert!(insert.is_none());
                 page_offset = page_offset
@@ -391,6 +438,7 @@ impl KernelDumpParser {
         }
 
         let number_pfns = metadata_size / pfn_range_size as u64;
+        let len = reader_len(reader)?;
         let mut physmem = Builder::new(strategy);
 
         for _ in 0..number_pfns {
@@ -411,14 +459,17 @@ impl KernelDumpParser {
                 break;
             }
 
-            for page_idx in 0..pfn_range.number_of_pages {
-                let gpa = gpa_from_pfn_range(&pfn_range, page_idx)
+            if pfn_range.number_of_pages > 0 {
+                let gpa =
+                    gpa_from_pfn_range(&pfn_range, 0).ok_or(Error::Overflow("w/ pfn_range"))?;
+                gpa_from_pfn_range(&pfn_range, pfn_range.number_of_pages - 1)
                     .ok_or(Error::Overflow("w/ pfn_range"))?;
-                let insert = physmem.push(gpa, page_offset);
+
+                // The range's pages must be in the file before they go in the index.
+                check_pages_fit(page_offset, pfn_range.number_of_pages, len)?;
+                let insert = physmem.push_run(gpa, pfn_range.number_of_pages, page_offset);
                 debug_assert!(insert);
-                page_offset = page_offset
-                    .checked_add(PageKind::Normal.size())
-                    .ok_or(Error::Overflow("w/ page_offset"))?;
+                page_offset += pfn_range.number_of_pages * PageKind::Normal.size();
             }
 
             page_count = page_count
