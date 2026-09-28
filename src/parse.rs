@@ -113,7 +113,8 @@ impl KernelDumpParser {
         Self::with_reader_and_strategy(reader, PhysIndexStrategy::default())
     }
 
-    /// Create an instance from a [`Reader`] with the chosen physical-memory index strategy.
+    /// Create an instance from a [`Reader`] with the chosen physical-memory
+    /// index strategy.
     pub fn with_reader_and_strategy(
         mut reader: impl Reader + 'static,
         strategy: PhysIndexStrategy,
@@ -157,9 +158,10 @@ impl KernelDumpParser {
         }
 
         // Now let's try to find out user-modules. For that we need the
-        // `KDDEBUGGER_DATA_BLOCK` structure to know where a bunch of things are.
-        // If we can't read the block, we'll have to stop the adventure here as we won't
-        // be able to read the things we need to keep going.
+        // `KDDEBUGGER_DATA_BLOCK` structure to know where a bunch of things
+        // are. If we can't read the block, we'll have to stop the
+        // adventure here as we won't be able to read the things we need
+        // to keep going.
         let virt_reader = virt::Reader::new(&parser);
         let Some(kd_debugger_data_block) = virt_reader
             .try_read_struct::<KdDebuggerData64>(parser.headers().kd_debugger_data_block.into())?
@@ -189,8 +191,8 @@ impl KernelDumpParser {
     /// either memory maps it or open it as a regular file.
     pub fn new(dump_path: impl AsRef<Path>) -> Result<Self> {
         const FOUR_GIGS: u64 = 1_024 * 1_024 * 1_024 * 4;
-        // We'll assume that if you are opening a dump file larger than 4gb, you don't
-        // want it memory mapped.
+        // We'll assume that if you are opening a dump file larger than 4gb, you
+        // don't want it memory mapped.
         let size = dump_path.as_ref().metadata()?.len();
 
         if let 0..=FOUR_GIGS = size {
@@ -332,8 +334,9 @@ impl KernelDumpParser {
             ));
         }
         if strategy == PhysIndexStrategy::Compact {
-            // Keep the bitmap, with a rank table, as the index. Read it in chunks so the
-            // allocation follows the bytes actually present in the file.
+            // Keep the bitmap, with a rank table, as the index. Read it in
+            // chunks so the allocation follows the bytes actually
+            // present in the file.
             let mut bits = Vec::new();
             let mut left = bitmap_size;
             let mut chunk = vec![0u8; 0x1_0000];
@@ -443,8 +446,9 @@ impl KernelDumpParser {
 
         for _ in 0..number_pfns {
             if dump_type == D::CompleteMemory {
-                // `CompleteMemoryDump` type seems to be bound by the `total_number_of_pages`
-                // field, *not* by `metadata_size`.
+                // `CompleteMemoryDump` type seems to be bound by the
+                // `total_number_of_pages` field, *not* by
+                // `metadata_size`.
                 if page_count == total_number_of_pages {
                     break;
                 }
@@ -465,7 +469,8 @@ impl KernelDumpParser {
                 gpa_from_pfn_range(&pfn_range, pfn_range.number_of_pages - 1)
                     .ok_or(Error::Overflow("w/ pfn_range"))?;
 
-                // The range's pages must be in the file before they go in the index.
+                // The range's pages must be in the file before they go in the
+                // index.
                 check_pages_fit(page_offset, pfn_range.number_of_pages, len)?;
                 let insert = physmem.push_run(gpa, pfn_range.number_of_pages, page_offset);
                 debug_assert!(insert);

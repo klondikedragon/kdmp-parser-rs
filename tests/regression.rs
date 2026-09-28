@@ -846,7 +846,8 @@ fn partial_phys() {
 
 #[test]
 fn physmem_strategies_agree() {
-    // Both index strategies must expose the same pages at the same file offsets.
+    // Both index strategies must expose the same pages at the same file
+    // offsets.
     for path in [
         BMP_PATH.as_path(),
         FULL_PATH.as_path(),
@@ -920,10 +921,10 @@ fn header_counts_checked_against_file_length() {
         synthetic_dump(
             5,
             |_| {},
-            &[
-                bmp_header(8 << 20, 0x2_038 + (1 << 20)),
-                vec![0xff; 1 << 20],
-            ]
+            &[bmp_header(8 << 20, 0x2_038 + (1 << 20)), vec![
+                0xff;
+                1 << 20
+            ]]
             .concat(),
         ),
         // Bitmap dump declaring 2^40 pages in a short file.
@@ -958,8 +959,8 @@ fn header_counts_checked_against_file_length() {
 
 #[test]
 fn cyclic_module_list_is_dropped() {
-    // Point the first loaded-module entry at itself so the walk never reaches the
-    // list head again.
+    // Point the first loaded-module entry at itself so the walk never reaches
+    // the list head again.
     let data = std::fs::read(BMP_PATH.as_path()).unwrap();
     let parser = KernelDumpParser::with_reader(std::io::Cursor::new(data.clone())).unwrap();
     let virt_reader = virt::Reader::new(&parser);
@@ -981,7 +982,8 @@ fn cyclic_module_list_is_dropped() {
 
 #[test]
 fn small_rdmp_sizes_do_not_underflow() {
-    // A metadata size below 0x20 used to underflow in `RdmpHeader64::looks_good`.
+    // A metadata size below 0x20 used to underflow in
+    // `RdmpHeader64::looks_good`.
     let mut rdmp = vec![0u8; 0x1_000];
     rdmp[0..4].copy_from_slice(&0x40u32.to_le_bytes());
     rdmp[4..8].copy_from_slice(b"RDMP");

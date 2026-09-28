@@ -58,7 +58,8 @@ fn try_read_unicode_string(
 pub type ModuleMap = HashMap<Range<Gva>, String>;
 
 /// Upper bound on the entries walked in one module list. Real lists hold a few
-/// hundred entries; a corrupted list can be cyclic without returning to the head.
+/// hundred entries; a corrupted list can be cyclic without returning to the
+/// head.
 const MAX_MODULE_LIST_ENTRIES: usize = 0x1_0000;
 
 /// Walk a `LIST_ENTRY` of `LdrDataTableEntry`. It is used to dump both the user
@@ -76,8 +77,8 @@ fn try_read_module_map<P: Pod + HasCheckedAdd>(
     let mut visited = HashSet::new();
     // We'll walk it until we hit the starting point (it is circular).
     while entry_addr != head {
-        // A corrupted list can loop without coming back to the head; treat it like an
-        // unreadable entry.
+        // A corrupted list can loop without coming back to the head; treat it
+        // like an unreadable entry.
         if !visited.insert(entry_addr) || visited.len() > MAX_MODULE_LIST_ENTRIES {
             return Ok(None);
         }
@@ -92,7 +93,8 @@ fn try_read_module_map<P: Pod + HasCheckedAdd>(
         let Some(dll_name) =
             try_read_unicode_string(reader, &data.full_dll_name).and_then(|s| {
                 if s.is_none() {
-                    // If we failed to read the `full_dll_name`, give `base_dll_name` a shot.
+                    // If we failed to read the `full_dll_name`, give
+                    // `base_dll_name` a shot.
                     try_read_unicode_string(reader, &data.base_dll_name)
                 } else {
                     Ok(s)
@@ -161,8 +163,9 @@ pub(crate) fn try_find_prcb(
         // ..and compare it to ours.
         let kprcb_context = Box::new(kprcb_context);
         if kprcb_context.rsp == parser.context_record().rsp {
-            // The register match so we'll assume the current KPRCB is the one describing
-            // the 'foreground' processor in the crash-dump.
+            // The register match so we'll assume the current KPRCB is the one
+            // describing the 'foreground' processor in the
+            // crash-dump.
             return Ok(Some(kprcb_addr.into()));
         }
 
