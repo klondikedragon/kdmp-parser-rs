@@ -23,7 +23,7 @@ impl<'parser> Reader<'parser> {
     /// Translate a [`Gpa`] into a file offset. At that file offset is where the
     /// content of the page resides in.
     pub fn translate(&self, gpa: Gpa) -> Result<SeekFrom> {
-        let Some(base_offset) = self.parser.physmem.get(&gpa.page_align()) else {
+        let Some(base_offset) = self.parser.physmem.get(gpa.page_align()) else {
             return Err(PageReadError::NotInDump { gva: None, gpa }.into());
         };
 

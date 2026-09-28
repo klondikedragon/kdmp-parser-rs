@@ -9,6 +9,7 @@ use std::sync::LazyLock;
 use kdmp_parser::error::{Error, PageReadError, PxeKind};
 use kdmp_parser::gxa::{Gpa, Gva};
 use kdmp_parser::parse::KernelDumpParser;
+use kdmp_parser::physindex::PhysIndexStrategy;
 use kdmp_parser::structs::{DumpType, PageKind};
 use kdmp_parser::{phys, virt};
 use serde::Deserialize;
@@ -841,4 +842,41 @@ fn partial_phys() {
         phys_reader.read_exact(0x01_5f_f0.into(), &mut buffer).inspect(|e| eprintln!("{e:?}")),
         Err(Error::PartialRead { reason: PageReadError::NotInDump { gva: None, gpa }, .. }) if gpa == 0x01_5f_f0.into()
     ));
+}
+
+#[test]
+fn physmem_strategies_agree() {
+    // Both index strategies must expose the same pages at the same file offsets.
+    for path in [
+        BMP_PATH.as_path(),
+        FULL_PATH.as_path(),
+        KERNEL_DUMP_PATH.as_path(),
+        KERNEL_USER_DUMP_PATH.as_path(),
+        COMPLETE_DUMP_PATH.as_path(),
+        LIVE_KERNEL_PATH.as_path(),
+        WOW64_DUMP_PATH.as_path(),
+    ] {
+        let open = |strategy| {
+            KernelDumpParser::with_reader_and_strategy(
+                std::io::BufReader::new(File::open(path).unwrap()),
+                strategy,
+            )
+            .unwrap()
+        };
+        let eager = open(PhysIndexStrategy::Eager);
+        let compact = open(PhysIndexStrategy::Compact);
+        assert_eq!(eager.physmem().len(), compact.physmem().len(), "{path:?}");
+        assert!(eager.physmem().eq(compact.physmem()), "{path:?}");
+
+        let (eager_reader, compact_reader) =
+            (phys::Reader::new(&eager), phys::Reader::new(&compact));
+        for (gpa, _) in eager.physmem().step_by(97) {
+            assert_eq!(
+                eager_reader.translate(gpa).unwrap(),
+                compact_reader.translate(gpa).unwrap(),
+                "{path:?} {gpa}"
+            );
+        }
+        assert!(compact_reader.translate(Gpa::new(!0xfff)).is_err());
+    }
 }

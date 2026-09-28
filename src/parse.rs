@@ -14,6 +14,7 @@ use crate::bits::Bits;
 use crate::error::{Error, Result};
 use crate::gxa::{Gpa, Gva};
 use crate::map::{MappedFileReader, Reader};
+use crate::physindex::{Builder, PhysIndex, PhysIndexStrategy};
 use crate::pxe::Pfn;
 use crate::structs::{
     BmpHeader64, Context, DUMP_HEADER64_EXPECTED_SIGNATURE, DUMP_HEADER64_EXPECTED_VALID_DUMP,
@@ -63,7 +64,7 @@ pub struct KernelDumpParser {
     headers: Box<Header64>,
     /// This maps a physical address to a file offset. Seeking there gives the
     /// page content.
-    pub(crate) physmem: PhysmemMap,
+    pub(crate) physmem: PhysIndex,
     /// The [`Reader`] object that allows us to seek / read the dump file which
     /// could be memory mapped, read from a file, etc.
     reader: RefCell<Box<dyn Reader>>,
@@ -85,7 +86,15 @@ impl Debug for KernelDumpParser {
 
 impl KernelDumpParser {
     /// Create an instance from a [`Reader`] & parse the file.
-    pub fn with_reader(mut reader: impl Reader + 'static) -> Result<Self> {
+    pub fn with_reader(reader: impl Reader + 'static) -> Result<Self> {
+        Self::with_reader_and_strategy(reader, PhysIndexStrategy::default())
+    }
+
+    /// Create an instance from a [`Reader`] with the chosen physical-memory index strategy.
+    pub fn with_reader_and_strategy(
+        mut reader: impl Reader + 'static,
+        strategy: PhysIndexStrategy,
+    ) -> Result<Self> {
         // Parse the dump header and check if things look right.
         let headers = Box::new(read_struct::<Header64>(&mut reader)?);
         if headers.signature != DUMP_HEADER64_EXPECTED_SIGNATURE {
@@ -100,7 +109,7 @@ impl KernelDumpParser {
         let dump_type = DumpType::try_from(headers.dump_type)?;
 
         // Let's figure out how to get physical memory out of this dump now.
-        let physmem = Self::build_physmem(dump_type, &headers, &mut reader)?;
+        let physmem = Self::build_physmem(dump_type, &headers, &mut reader, strategy)?;
 
         // Read the context record.
         let context = Box::new(read_struct(&mut io::Cursor::new(
@@ -176,7 +185,7 @@ impl KernelDumpParser {
     /// content of the page can be found. The offset is relevant with the
     /// associated `reader`.
     pub fn physmem(&self) -> impl ExactSizeIterator<Item = (Gpa, u64)> + '_ {
-        self.physmem.iter().map(|(&k, &v)| (k, v))
+        self.physmem.iter()
     }
 
     /// Kernel modules loaded when the dump was taken.
@@ -236,11 +245,15 @@ impl KernelDumpParser {
     /// and stored one after another. If the first page of the first run is
     /// at file offset `0x2_000`, then the first page of the second run is at
     /// file offset `0x2_000+(2*0x1_000)`.
-    fn full_physmem(headers: &Header64, reader: &mut impl Reader) -> Result<PhysmemMap> {
+    fn full_physmem(
+        headers: &Header64,
+        reader: &mut impl Reader,
+        strategy: PhysIndexStrategy,
+    ) -> Result<PhysIndex> {
         let mut page_offset = reader.stream_position()?;
         let mut run_cursor = io::Cursor::new(headers.physical_memory_block_buffer);
         let physmem_desc = read_struct::<PhysmemDesc>(&mut run_cursor)?;
-        let mut physmem = PhysmemMap::new();
+        let mut physmem = Builder::new(strategy);
 
         for run_idx in 0..physmem_desc.number_of_runs {
             let run = read_struct::<PhysmemRun>(&mut run_cursor)?;
@@ -251,7 +264,7 @@ impl KernelDumpParser {
                     .ok_or(Error::PhysAddrOverflow(run_idx, page_idx))?;
 
                 // We now know where this page lives at, insert it into the physmem map.
-                if physmem.insert(phys_addr, page_offset).is_some() {
+                if !physmem.push(phys_addr, page_offset) {
                     return Err(Error::DuplicateGpa(phys_addr));
                 }
 
@@ -262,11 +275,11 @@ impl KernelDumpParser {
             }
         }
 
-        Ok(physmem)
+        physmem.finish()
     }
 
     /// Build the physical memory map for a [`DumpType::Bmp`] dump.
-    fn bmp_physmem(reader: &mut impl Reader) -> Result<PhysmemMap> {
+    fn bmp_physmem(reader: &mut impl Reader, strategy: PhysIndexStrategy) -> Result<PhysIndex> {
         let bmp_header = read_struct::<BmpHeader64>(reader)?;
         if !bmp_header.looks_good() {
             return Err(Error::InvalidData("bmp header doesn't look right"));
@@ -275,6 +288,25 @@ impl KernelDumpParser {
         let remaining_bits = bmp_header.pages % 8;
         let bitmap_size = bmp_header.pages.div_ceil(8);
         let mut page_offset = bmp_header.first_page;
+        if strategy == PhysIndexStrategy::Compact {
+            // Keep the bitmap, with a rank table, as the index. Read it in chunks so the
+            // allocation follows the bytes actually present in the file.
+            let mut bits = Vec::new();
+            let mut left = bitmap_size;
+            let mut chunk = vec![0u8; 0x1_0000];
+            while left > 0 {
+                let n = usize::try_from(left.min(chunk.len() as u64)).unwrap();
+                reader.read_exact(&mut chunk[..n])?;
+                bits.extend_from_slice(&chunk[..n]);
+                left -= n as u64;
+            }
+            if remaining_bits != 0
+                && let Some(last) = bits.last_mut()
+            {
+                *last &= (1u8 << remaining_bits).wrapping_sub(1);
+            }
+            return Ok(PhysIndex::bitmap(page_offset, bits));
+        }
         let mut physmem = PhysmemMap::new();
 
         // Walk the bitmap byte per byte..
@@ -309,12 +341,16 @@ impl KernelDumpParser {
             }
         }
 
-        Ok(physmem)
+        Ok(PhysIndex::Eager(physmem))
     }
 
     /// Build the physical memory map for [`DumpType::KernelMemory`] /
     /// [`DumpType::KernelAndUserMemory`] and [`DumpType::CompleteMemory`] dump.
-    fn kernel_physmem(dump_type: DumpType, reader: &mut impl Reader) -> Result<PhysmemMap> {
+    fn kernel_physmem(
+        dump_type: DumpType,
+        reader: &mut impl Reader,
+        strategy: PhysIndexStrategy,
+    ) -> Result<PhysIndex> {
         use DumpType as D;
         let mut page_count = 0u64;
         let (mut page_offset, metadata_size, total_number_of_pages) = match dump_type {
@@ -355,7 +391,7 @@ impl KernelDumpParser {
         }
 
         let number_pfns = metadata_size / pfn_range_size as u64;
-        let mut physmem = PhysmemMap::new();
+        let mut physmem = Builder::new(strategy);
 
         for _ in 0..number_pfns {
             if dump_type == D::CompleteMemory {
@@ -378,8 +414,8 @@ impl KernelDumpParser {
             for page_idx in 0..pfn_range.number_of_pages {
                 let gpa = gpa_from_pfn_range(&pfn_range, page_idx)
                     .ok_or(Error::Overflow("w/ pfn_range"))?;
-                let insert = physmem.insert(gpa, page_offset);
-                debug_assert!(insert.is_none());
+                let insert = physmem.push(gpa, page_offset);
+                debug_assert!(insert);
                 page_offset = page_offset
                     .checked_add(PageKind::Normal.size())
                     .ok_or(Error::Overflow("w/ page_offset"))?;
@@ -390,20 +426,21 @@ impl KernelDumpParser {
                 .ok_or(Error::Overflow("w/ page_count"))?;
         }
 
-        Ok(physmem)
+        physmem.finish()
     }
 
     fn build_physmem(
         dump_type: DumpType,
         headers: &Header64,
         reader: &mut impl Reader,
-    ) -> Result<PhysmemMap> {
+        strategy: PhysIndexStrategy,
+    ) -> Result<PhysIndex> {
         use DumpType as D;
         match dump_type {
-            D::Full => Self::full_physmem(headers, reader),
-            D::Bmp | D::LiveKernelMemory => Self::bmp_physmem(reader),
+            D::Full => Self::full_physmem(headers, reader, strategy),
+            D::Bmp | D::LiveKernelMemory => Self::bmp_physmem(reader, strategy),
             D::KernelMemory | D::KernelAndUserMemory | D::CompleteMemory => {
-                Self::kernel_physmem(dump_type, reader)
+                Self::kernel_physmem(dump_type, reader, strategy)
             }
         }
     }
