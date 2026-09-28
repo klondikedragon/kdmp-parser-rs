@@ -978,3 +978,20 @@ fn cyclic_module_list_is_dropped() {
     let parser = KernelDumpParser::with_reader(std::io::Cursor::new(bad)).unwrap();
     assert_eq!(parser.kernel_modules().len(), 0);
 }
+
+#[test]
+fn small_rdmp_sizes_do_not_underflow() {
+    // A metadata size below 0x20 used to underflow in `RdmpHeader64::looks_good`.
+    let mut rdmp = vec![0u8; 0x1_000];
+    rdmp[0..4].copy_from_slice(&0x40u32.to_le_bytes());
+    rdmp[4..8].copy_from_slice(b"RDMP");
+    rdmp[8..12].copy_from_slice(b"DUMP");
+    rdmp[0x10..0x18].copy_from_slice(&0x10u64.to_le_bytes());
+    rdmp[0x18..0x20].copy_from_slice(&0x10u64.to_le_bytes());
+    let data = synthetic_dump(8, |_| {}, &rdmp);
+
+    assert!(matches!(
+        KernelDumpParser::with_reader(std::io::Cursor::new(data)),
+        Err(Error::InvalidData(_))
+    ));
+}

@@ -448,8 +448,13 @@ impl RdmpHeader64 {
             return false;
         }
 
-        if self.metadata_size - 0x20 != self.first_page_offset - 0x20_40 {
-            return false;
+        // Both fields come from the file, so a small value must not underflow.
+        match (
+            self.metadata_size.checked_sub(0x20),
+            self.first_page_offset.checked_sub(0x20_40),
+        ) {
+            (Some(metadata), Some(first_page)) if metadata == first_page => {}
+            _ => return false,
         }
 
         true
