@@ -108,7 +108,7 @@ fn try_read_module_map<P: Pod + HasCheckedAdd>(
         let dll_end_addr = data
             .dll_base
             .checked_add(data.size_of_image.into())
-            .ok_or(Error::Overflow("module address"))?;
+            .ok_or(Error::InvalidData("overflow w/ module address"))?;
         let at = Gva::new(data.dll_base.into())..Gva::new(dll_end_addr.into());
         let inserted = modules.insert(at, dll_name);
         debug_assert!(inserted.is_none());
@@ -146,7 +146,7 @@ pub(crate) fn try_find_prcb(
         // Calculate the address of where the CONTEXT pointer is at..
         let kprcb_context_addr = kprcb_addr
             .checked_add(kd_debugger_data_block.offset_prcb_context.into())
-            .ok_or(Error::Overflow("offset_prcb"))?;
+            .ok_or(Error::InvalidData("overflow w/ offset_prcb"))?;
 
         // ..and read it.
         let Some(kprcb_context_addr) = reader.try_read_struct::<u64>(kprcb_context_addr.into())?
@@ -172,7 +172,7 @@ pub(crate) fn try_find_prcb(
         // Otherwise, let's move on to the next pointer.
         processor_block = processor_block
             .checked_add(size_of::<u64>() as _)
-            .ok_or(Error::Overflow("kprcb ptr"))?;
+            .ok_or(Error::InvalidData("overflow w/ kprcb ptr"))?;
     }
 
     Ok(None)
@@ -189,7 +189,7 @@ pub(crate) fn try_extract_user_modules(
     let kthread_addr = prcb_addr
         .u64()
         .checked_add(kd_debugger_data_block.offset_prcb_current_thread.into())
-        .ok_or(Error::Overflow("offset prcb current thread"))?;
+        .ok_or(Error::InvalidData("overflow w/ offset prcb current thread"))?;
     let Some(kthread_addr) = reader.try_read_struct::<u64>(kthread_addr.into())? else {
         return Ok(None);
     };
@@ -197,7 +197,7 @@ pub(crate) fn try_extract_user_modules(
     // ..then its TEB..
     let teb_addr = kthread_addr
         .checked_add(kd_debugger_data_block.offset_kthread_teb.into())
-        .ok_or(Error::Overflow("offset kthread teb"))?;
+        .ok_or(Error::InvalidData("overflow w/ offset kthread teb"))?;
     let Some(teb_addr) = reader.try_read_struct::<u64>(teb_addr.into())? else {
         return Ok(None);
     };
@@ -215,7 +215,7 @@ pub(crate) fn try_extract_user_modules(
     let peb_offset = 0x60;
     let peb_addr = teb_addr
         .checked_add(peb_offset)
-        .ok_or(Error::Overflow("peb offset"))?;
+        .ok_or(Error::InvalidData("overflow w/ peb offset"))?;
     let Some(peb_addr) = reader.try_read_struct::<u64>(peb_addr.into())? else {
         return Ok(None);
     };
@@ -228,7 +228,7 @@ pub(crate) fn try_extract_user_modules(
     let ldr_offset = 0x18;
     let peb_ldr_addr = peb_addr
         .checked_add(ldr_offset)
-        .ok_or(Error::Overflow("ldr offset"))?;
+        .ok_or(Error::InvalidData("overflow w/ ldr offset"))?;
     let Some(peb_ldr_addr) = reader.try_read_struct::<u64>(peb_ldr_addr.into())? else {
         return Ok(None);
     };
@@ -241,7 +241,9 @@ pub(crate) fn try_extract_user_modules(
     let in_load_order_module_list_offset = 0x10;
     let module_list_entry_addr = peb_ldr_addr
         .checked_add(in_load_order_module_list_offset)
-        .ok_or(Error::Overflow("in load order module list offset"))?;
+        .ok_or(Error::InvalidData(
+            "overflow w/ in load order module list offset",
+        ))?;
 
     // From there, we walk the list!
     let Some(mut modules) = try_read_module_map::<u64>(reader, module_list_entry_addr.into())?
@@ -260,11 +262,11 @@ pub(crate) fn try_extract_user_modules(
     let teb32_offset = 0x2_000;
     let teb32_addr = teb_addr
         .checked_add(teb32_offset)
-        .ok_or(Error::Overflow("teb32 offset"))?;
+        .ok_or(Error::InvalidData("overflow w/ teb32 offset"))?;
     let peb32_offset = 0x30;
     let peb32_addr = teb32_addr
         .checked_add(peb32_offset)
-        .ok_or(Error::Overflow("peb32 offset"))?;
+        .ok_or(Error::InvalidData("overflow w/ peb32 offset"))?;
     let Some(peb32_addr) = reader.try_read_struct::<u32>(peb32_addr.into())? else {
         return Ok(Some(modules));
     };
@@ -277,7 +279,7 @@ pub(crate) fn try_extract_user_modules(
     let ldr_offset = 0x0c;
     let peb32_ldr_addr = peb32_addr
         .checked_add(ldr_offset)
-        .ok_or(Error::Overflow("ldr32 offset"))?;
+        .ok_or(Error::InvalidData("overflow w/ ldr32 offset"))?;
     let Some(peb32_ldr_addr) = reader.try_read_struct::<u32>(Gva::new(peb32_ldr_addr.into()))?
     else {
         return Ok(Some(modules));
@@ -291,7 +293,9 @@ pub(crate) fn try_extract_user_modules(
     let in_load_order_module_list_offset = 0xc;
     let module_list_entry_addr = peb32_ldr_addr
         .checked_add(in_load_order_module_list_offset)
-        .ok_or(Error::Overflow("in load order module list offset"))?;
+        .ok_or(Error::InvalidData(
+            "overflow w/ in load order module list offset",
+        ))?;
 
     // From there, we walk the list!
     let Some(modules32) =

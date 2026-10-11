@@ -9,7 +9,6 @@ use std::sync::LazyLock;
 use kdmp_parser::error::{Error, PageReadError, PxeKind};
 use kdmp_parser::gxa::{Gpa, Gva};
 use kdmp_parser::parse::KernelDumpParser;
-use kdmp_parser::physindex::PhysIndexStrategy;
 use kdmp_parser::structs::{DumpType, PageKind};
 use kdmp_parser::{phys, virt};
 use serde::Deserialize;
@@ -424,7 +423,7 @@ fn regressions() {
         let phys_reader = phys::Reader::new(&parser);
         eprintln!("{parser:?}");
         assert_eq!(parser.dump_type(), test.dump_type);
-        assert_eq!(parser.physmem().len(), usize::try_from(test.size).unwrap());
+        assert_eq!(parser.gpas().len(), usize::try_from(test.size).unwrap());
         let mut buf = [0; 16];
         phys_reader
             .read_exact(Gpa::new(test.phys_addr), &mut buf)
@@ -844,44 +843,6 @@ fn partial_phys() {
     ));
 }
 
-#[test]
-fn physmem_strategies_agree() {
-    // Both index strategies must expose the same pages at the same file
-    // offsets.
-    for path in [
-        BMP_PATH.as_path(),
-        FULL_PATH.as_path(),
-        KERNEL_DUMP_PATH.as_path(),
-        KERNEL_USER_DUMP_PATH.as_path(),
-        COMPLETE_DUMP_PATH.as_path(),
-        LIVE_KERNEL_PATH.as_path(),
-        WOW64_DUMP_PATH.as_path(),
-    ] {
-        let open = |strategy| {
-            KernelDumpParser::with_reader_and_strategy(
-                std::io::BufReader::new(File::open(path).unwrap()),
-                strategy,
-            )
-            .unwrap()
-        };
-        let eager = open(PhysIndexStrategy::Eager);
-        let compact = open(PhysIndexStrategy::Compact);
-        assert_eq!(eager.physmem().len(), compact.physmem().len(), "{path:?}");
-        assert!(eager.physmem().eq(compact.physmem()), "{path:?}");
-
-        let (eager_reader, compact_reader) =
-            (phys::Reader::new(&eager), phys::Reader::new(&compact));
-        for (gpa, _) in eager.physmem().step_by(97) {
-            assert_eq!(
-                eager_reader.translate(gpa).unwrap(),
-                compact_reader.translate(gpa).unwrap(),
-                "{path:?} {gpa}"
-            );
-        }
-        assert!(compact_reader.translate(Gpa::new(!0xfff)).is_err());
-    }
-}
-
 /// Builds a dump from the first page of a real dump with a different dump type
 /// and whatever follows the header.
 fn synthetic_dump(dump_type: u32, patch: impl Fn(&mut [u8]), tail: &[u8]) -> Vec<u8> {
@@ -947,13 +908,8 @@ fn header_counts_checked_against_file_length() {
         }),
     ];
     for (i, data) in cases.iter().enumerate() {
-        for strategy in [PhysIndexStrategy::Eager, PhysIndexStrategy::Compact] {
-            let res = KernelDumpParser::with_reader_and_strategy(
-                std::io::Cursor::new(data.clone()),
-                strategy,
-            );
-            assert!(res.is_err(), "case {i} {strategy:?}");
-        }
+        let res = KernelDumpParser::with_reader(std::io::Cursor::new(data.clone()));
+        assert!(res.is_err(), "case {i}");
     }
 }
 

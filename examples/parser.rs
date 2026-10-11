@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         );
 
         if addr == u64::MAX {
-            for (gpa, _) in parser.physmem() {
+            for gpa in parser.gpas() {
                 phys_reader.read_exact(gpa, &mut buffer)?;
                 hexdump(gpa.u64(), &buffer, args.len);
             }

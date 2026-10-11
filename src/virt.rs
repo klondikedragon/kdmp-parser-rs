@@ -215,7 +215,7 @@ impl<'parser> Reader<'parser> {
             // memory pages. First, figure out the maximum amount of
             // bytes we can read off this page.
             let left_in_page =
-                usize::try_from(translation.page_kind.size() - translation.offset).unwrap();
+                usize::try_from(translation.page_kind.len() - translation.offset).unwrap();
             // Then, either we read it until its end, or we stop before if we
             // can get by with less.
             let amount_wanted = min(amount_left, left_in_page);

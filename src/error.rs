@@ -93,7 +93,6 @@ impl Display for PageReadError {
 pub enum Error {
     InvalidUnicodeString,
     Utf16(FromUtf16Error),
-    Overflow(&'static str),
     Io(io::Error),
     InvalidData(&'static str),
     UnknownDumpType(u32),
@@ -134,7 +133,6 @@ impl Display for Error {
         match self {
             Self::InvalidUnicodeString => write!(f, "invalid UNICODE_STRING"),
             Self::Utf16(_) => write!(f, "utf16"),
-            Self::Overflow(o) => write!(f, "overflow: {o}"),
             Self::Io(_) => write!(f, "io"),
             Self::InvalidData(i) => write!(f, "invalid data: {i}"),
             Self::UnknownDumpType(u) => write!(f, "unsupported dump type {u:#x}"),

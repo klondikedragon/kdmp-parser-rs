@@ -23,14 +23,14 @@ impl<'parser> Reader<'parser> {
     /// Translate a [`Gpa`] into a file offset. At that file offset is where the
     /// content of the page resides in.
     pub fn translate(&self, gpa: Gpa) -> Result<SeekFrom> {
-        let Some(base_offset) = self.parser.physmem.get(gpa.page_align()) else {
+        let Some(base_offset) = self.parser.physidx.get(gpa.page_align()) else {
             return Err(PageReadError::NotInDump { gva: None, gpa }.into());
         };
 
         base_offset
             .checked_add(gpa.offset())
             .map(SeekFrom::Start)
-            .ok_or(Error::Overflow("w/ gpa offset"))
+            .ok_or(Error::InvalidData("overflow w/ gpa offset"))
     }
 
     /// Read the exact amount of bytes asked by the user & return a
@@ -71,7 +71,7 @@ impl<'parser> Reader<'parser> {
             // of bytes we can read off this page. Either, we read
             // it until its end, or we stop if the user wants us to read
             // less.
-            let left_in_page = usize::try_from(PageKind::Normal.size() - gpa.offset()).unwrap();
+            let left_in_page = usize::try_from(PageKind::Normal.len() - gpa.offset()).unwrap();
             let amount_wanted = min(amount_left, left_in_page);
             // Figure out where we should read into.
             let slice = &mut buf[total_read..total_read + amount_wanted];

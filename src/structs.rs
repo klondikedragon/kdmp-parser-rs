@@ -6,7 +6,7 @@ use std::fmt::Debug;
 use crate::error::{Error, Result};
 use crate::gxa::Gpa;
 
-/// We use this `Pod` trait to implement / constraint the `*read_struct`
+/// We use this `Pod` trait to implement / constraint the `read_struct`
 /// functions. For the functions to work as expected and be safe, here is the
 /// rule that a type `T` needs to follow to be `Pod`:
 ///   - `T` should not contain a field / type that have invalid bit patterns (no
@@ -40,9 +40,10 @@ pub enum PageKind {
 }
 
 impl PageKind {
-    /// Size in bytes of the page.
+    /// Length in bytes of the page.
+    #[expect(clippy::len_without_is_empty)]
     #[must_use]
-    pub fn size(&self) -> u64 {
+    pub const fn len(&self) -> u64 {
         match self {
             Self::Normal => 4 * 1_024,
             Self::Large => 2 * 1_024 * 1_024,
@@ -52,8 +53,8 @@ impl PageKind {
 
     /// Extract the page offset of `addr`.
     #[must_use]
-    pub fn page_offset(&self, addr: u64) -> u64 {
-        let mask = self.size() - 1;
+    pub const fn page_offset(&self, addr: u64) -> u64 {
+        let mask = self.len() - 1;
 
         addr & mask
     }
@@ -241,16 +242,36 @@ pub struct PhysmemRun {
 unsafe impl Pod for PhysmemRun {}
 
 impl PhysmemRun {
-    /// Calculate a physical address from a run and an index.
+    /// Calculate a physical address from a page index.
     ///
     /// The formulae is: (`base_page` + `page_idx`) * `PageKind::Normal.size()`.
-    pub fn phys_addr(&self, page_idx: u64) -> Option<Gpa> {
-        debug_assert!(page_idx < self.page_count);
+    pub fn page_phys_addr(&self, page_idx: u64) -> Option<Gpa> {
+        if page_idx >= self.page_count {
+            return None;
+        }
 
         self.base_page
             .checked_add(page_idx)?
-            .checked_mul(PageKind::Normal.size())
+            .checked_mul(PageKind::Normal.len())
             .map(Gpa::new)
+    }
+
+    /// The GPA of the first page described by this run.
+    #[must_use]
+    pub fn first_page_phys_addr(&self) -> Option<Gpa> {
+        self.page_phys_addr(0)
+    }
+
+    /// The GPA of the last page described by this run.
+    #[must_use]
+    pub fn last_page_phys_addr(&self) -> Option<Gpa> {
+        self.page_phys_addr(self.page_count.checked_sub(1)?)
+    }
+
+    // Total length in bytes of the run.
+    #[must_use]
+    pub fn total_len(&self) -> Option<u64> {
+        self.page_count.checked_mul(PageKind::Normal.len())
     }
 }
 
@@ -493,6 +514,43 @@ pub struct PfnRange {
 }
 
 unsafe impl Pod for PfnRange {}
+
+// XXX: The methods below are copies of [`PhysmemRun`]; could be good to merge
+// the types maybe? Or common trait?
+impl PfnRange {
+    /// Calculate a physical address from a page index.
+    ///
+    /// The formulae is: (`page_file_number` + `page_idx`) *
+    /// `PageKind::Normal.size()`.
+    pub fn page_phys_addr(&self, page_idx: u64) -> Option<Gpa> {
+        if page_idx >= self.number_of_pages {
+            return None;
+        }
+
+        self.page_file_number
+            .checked_add(page_idx)?
+            .checked_mul(PageKind::Normal.len())
+            .map(Gpa::new)
+    }
+
+    /// The GPA of the first page described by this run.
+    #[must_use]
+    pub fn first_page_phys_addr(&self) -> Option<Gpa> {
+        self.page_phys_addr(0)
+    }
+
+    /// The GPA of the last page described by this run.
+    #[must_use]
+    pub fn last_page_phys_addr(&self) -> Option<Gpa> {
+        self.page_phys_addr(self.number_of_pages.checked_sub(1)?)
+    }
+
+    // Total length in bytes of the run.
+    #[must_use]
+    pub fn total_len(&self) -> Option<u64> {
+        self.number_of_pages.checked_mul(PageKind::Normal.len())
+    }
+}
 
 #[repr(C)]
 #[derive(Debug, Default)]

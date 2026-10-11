@@ -5,64 +5,47 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
 use std::fs::File;
+use std::io::{Cursor, SeekFrom};
 use std::mem::MaybeUninit;
+use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::Path;
-use std::{io, mem};
 
-use crate::bits::Bits;
 use crate::error::{Error, Result};
 use crate::gxa::{Gpa, Gva};
 use crate::map::{MappedFileReader, Reader};
-use crate::physindex::{Builder, PhysIndex, PhysIndexStrategy};
-use crate::pxe::Pfn;
+use crate::physindex::{Builder, PhysIndex};
 use crate::structs::{
     BmpHeader64, Context, DUMP_HEADER64_EXPECTED_SIGNATURE, DUMP_HEADER64_EXPECTED_VALID_DUMP,
     DumpType, ExceptionRecord64, FullRdmpHeader64, Header64, KdDebuggerData64, KernelRdmpHeader64,
-    PageKind, PfnRange, PhysmemDesc, PhysmemMap, PhysmemRun, Pod,
+    PageKind, PfnRange, PhysmemDesc, PhysmemRun, Pod,
 };
 use crate::virt;
 use crate::virt_utils::{
     ModuleMap, try_extract_kernel_modules, try_extract_user_modules, try_find_prcb,
 };
 
-fn gpa_from_bitmap(bitmap_idx: u64, bit_idx: usize) -> Option<Gpa> {
-    let pfn = Pfn::new(
-        bitmap_idx
-            .checked_mul(8)?
-            .checked_add(bit_idx.try_into().ok()?)?,
-    );
-
-    Some(pfn.gpa())
-}
-
-fn gpa_from_pfn_range(pfn_range: &PfnRange, page_idx: u64) -> Option<Gpa> {
-    let offset = page_idx.checked_mul(PageKind::Normal.size())?;
-
-    Some(Pfn::new(pfn_range.page_file_number).gpa_with_offset(offset))
-}
-
 /// Total length of the reader, leaving its position unchanged.
 fn reader_len(reader: &mut impl Reader) -> Result<u64> {
     let pos = reader.stream_position()?;
-    let len = reader.seek(io::SeekFrom::End(0))?;
-    reader.seek(io::SeekFrom::Start(pos))?;
+    let len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(pos))?;
 
     Ok(len)
 }
 
 /// Checks that `pages` pages stored from `file_offset` fit in a reader of
 /// `len` bytes.
-fn check_pages_fit(file_offset: u64, pages: u64, len: u64) -> Result<()> {
-    let end = pages
-        .checked_mul(PageKind::Normal.size())
+fn check_pages_fit(file_offset: u64, pages: NonZeroU64, reader_len: u64) -> bool {
+    let Some(end) = pages
+        .get()
+        .checked_mul(PageKind::Normal.len())
         .and_then(|size| file_offset.checked_add(size))
-        .ok_or(Error::Overflow("page range"))?;
-    if end > len {
-        return Err(Error::InvalidData("pages extend past the end of the file"));
-    }
+    else {
+        return false;
+    };
 
-    Ok(())
+    end <= reader_len
 }
 
 /// Read a `T` from the cursor.
@@ -85,9 +68,8 @@ pub struct KernelDumpParser {
     context: Box<Context>,
     /// The dump headers.
     headers: Box<Header64>,
-    /// This maps a physical address to a file offset. Seeking there gives the
-    /// page content.
-    pub(crate) physmem: PhysIndex,
+    /// Index the physical memory space.
+    pub(crate) physidx: PhysIndex,
     /// The [`Reader`] object that allows us to seek / read the dump file which
     /// could be memory mapped, read from a file, etc.
     reader: RefCell<Box<dyn Reader>>,
@@ -109,16 +91,7 @@ impl Debug for KernelDumpParser {
 
 impl KernelDumpParser {
     /// Create an instance from a [`Reader`] & parse the file.
-    pub fn with_reader(reader: impl Reader + 'static) -> Result<Self> {
-        Self::with_reader_and_strategy(reader, PhysIndexStrategy::default())
-    }
-
-    /// Create an instance from a [`Reader`] with the chosen physical-memory
-    /// index strategy.
-    pub fn with_reader_and_strategy(
-        mut reader: impl Reader + 'static,
-        strategy: PhysIndexStrategy,
-    ) -> Result<Self> {
+    pub fn with_reader(mut reader: impl Reader + 'static) -> Result<Self> {
         // Parse the dump header and check if things look right.
         let headers = Box::new(read_struct::<Header64>(&mut reader)?);
         if headers.signature != DUMP_HEADER64_EXPECTED_SIGNATURE {
@@ -133,10 +106,10 @@ impl KernelDumpParser {
         let dump_type = DumpType::try_from(headers.dump_type)?;
 
         // Let's figure out how to get physical memory out of this dump now.
-        let physmem = Self::build_physmem(dump_type, &headers, &mut reader, strategy)?;
+        let physidx = Self::build_phyidx(dump_type, &headers, &mut reader)?;
 
         // Read the context record.
-        let context = Box::new(read_struct(&mut io::Cursor::new(
+        let context = Box::new(read_struct(&mut Cursor::new(
             headers.context_record_buffer.as_slice(),
         ))?);
 
@@ -145,7 +118,7 @@ impl KernelDumpParser {
             dump_type,
             context,
             headers,
-            physmem,
+            physidx,
             reader,
             kernel_modules: HashMap::default(),
             user_modules: HashMap::default(),
@@ -206,11 +179,11 @@ impl KernelDumpParser {
         }
     }
 
-    /// Physical memory map that maps page aligned [`Gpa`] to `offset` where the
-    /// content of the page can be found. The offset is relevant with the
-    /// associated `reader`.
-    pub fn physmem(&self) -> impl ExactSizeIterator<Item = (Gpa, u64)> + '_ {
-        self.physmem.iter()
+    /// Get a list of every GPAs available in this dump.
+    pub fn gpas(&self) -> impl ExactSizeIterator<Item = Gpa> + '_ {
+        // We don't surface the offset to the user because they can't really do
+        // anything w/ it (cf gh issue #16).
+        self.physidx.iter().map(|(gpa, _)| gpa)
     }
 
     /// Kernel modules loaded when the dump was taken.
@@ -244,7 +217,7 @@ impl KernelDumpParser {
     }
 
     /// Seek to `pos`.
-    pub(crate) fn seek(&self, pos: io::SeekFrom) -> Result<u64> {
+    pub(crate) fn seek(&self, pos: SeekFrom) -> Result<u64> {
         Ok(self.reader.borrow_mut().seek(pos)?)
     }
 
@@ -253,7 +226,7 @@ impl KernelDumpParser {
         Ok(self.reader.borrow_mut().read_exact(buf)?)
     }
 
-    /// Build the physical memory map for a [`DumpType::Full`] dump.
+    /// Build the physical memory index for a [`DumpType::Full`] dump.
     ///
     /// Here is how runs works. Every `runs` document a number of consecutive
     /// physical pages starting at a `PFN`. This means that you can have
@@ -270,51 +243,47 @@ impl KernelDumpParser {
     /// and stored one after another. If the first page of the first run is
     /// at file offset `0x2_000`, then the first page of the second run is at
     /// file offset `0x2_000+(2*0x1_000)`.
-    fn full_physmem(
-        headers: &Header64,
-        reader: &mut impl Reader,
-        strategy: PhysIndexStrategy,
-    ) -> Result<PhysIndex> {
-        let len = reader_len(reader)?;
+    fn full_physindex(headers: &Header64, reader: &mut impl Reader) -> Result<PhysIndex> {
+        let reader_len = reader_len(reader)?;
         let mut page_offset = reader.stream_position()?;
-        let mut run_cursor = io::Cursor::new(headers.physical_memory_block_buffer);
+        let mut run_cursor = Cursor::new(headers.physical_memory_block_buffer);
         let physmem_desc = read_struct::<PhysmemDesc>(&mut run_cursor)?;
-        let max_runs = (headers.physical_memory_block_buffer.len() - mem::size_of::<PhysmemDesc>())
-            / mem::size_of::<PhysmemRun>();
-        if usize::try_from(physmem_desc.number_of_runs).map_or(true, |n| n > max_runs) {
-            return Err(Error::InvalidData("too many physical memory runs"));
-        }
 
-        let mut physmem = Builder::new(strategy);
-
-        for run_idx in 0..physmem_desc.number_of_runs {
+        let mut physidx = Builder::new();
+        for _ in 0..physmem_desc.number_of_runs {
             let run = read_struct::<PhysmemRun>(&mut run_cursor)?;
-            if run.page_count == 0 {
-                continue;
+            let Some(page_count) = NonZeroU64::new(run.page_count) else {
+                return Err(Error::InvalidData("zero page_count"));
+            };
+
+            // Guard against `page_count` that would extend past the file.
+            if !check_pages_fit(page_offset, page_count, reader_len) {
+                return Err(Error::InvalidData("run doesn't fit"));
             }
 
-            // Calculate the physical addresses of the first and last pages.
+            // Calculate the physical address of the first page..
             let phys_addr = run
-                .phys_addr(0)
-                .ok_or(Error::PhysAddrOverflow(run_idx, 0))?;
-            run.phys_addr(run.page_count - 1)
-                .ok_or(Error::PhysAddrOverflow(run_idx, run.page_count - 1))?;
+                .first_page_phys_addr()
+                .ok_or(Error::InvalidData("overflow w/ physmemrun first"))?;
 
-            // The run's pages must be in the file before they go in the index.
-            check_pages_fit(page_offset, run.page_count, len)?;
-            if !physmem.push_run(phys_addr, run.page_count, page_offset) {
-                return Err(Error::DuplicateGpa(phys_addr));
-            }
+            // ..and make sure the end of the run doesn't overflow either.
+            run.last_page_phys_addr()
+                .ok_or(Error::InvalidData("overflow w/ physmemrun last"))?;
+
+            // This is looking sane so push the run into the index.
+            physidx.push_run(phys_addr, page_count, page_offset);
 
             // Move the page offset along.
-            page_offset += run.page_count * PageKind::Normal.size();
+            page_offset += run
+                .total_len()
+                .ok_or(Error::InvalidData("overflow w/ page offset"))?;
         }
 
-        physmem.finish()
+        physidx.finish()
     }
 
-    /// Build the physical memory map for a [`DumpType::Bmp`] dump.
-    fn bmp_physmem(reader: &mut impl Reader, strategy: PhysIndexStrategy) -> Result<PhysIndex> {
+    /// Build the physical memory index for a [`DumpType::Bmp`] dump.
+    fn bmp_physindex(reader: &mut impl Reader) -> Result<PhysIndex> {
         let bmp_header = read_struct::<BmpHeader64>(reader)?;
         if !bmp_header.looks_good() {
             return Err(Error::InvalidData("bmp header doesn't look right"));
@@ -322,7 +291,7 @@ impl KernelDumpParser {
 
         let remaining_bits = bmp_header.pages % 8;
         let bitmap_size = bmp_header.pages.div_ceil(8);
-        let mut page_offset = bmp_header.first_page;
+        let page_offset = bmp_header.first_page;
         let len = reader_len(reader)?;
         if reader
             .stream_position()?
@@ -333,74 +302,40 @@ impl KernelDumpParser {
                 "bitmap extends past the end of the file",
             ));
         }
-        if strategy == PhysIndexStrategy::Compact {
-            // Keep the bitmap, with a rank table, as the index. Read it in
-            // chunks so the allocation follows the bytes actually
-            // present in the file.
-            let mut bits = Vec::new();
-            let mut left = bitmap_size;
-            let mut chunk = vec![0u8; 0x1_0000];
-            while left > 0 {
-                let n = usize::try_from(left.min(chunk.len() as u64)).unwrap();
-                reader.read_exact(&mut chunk[..n])?;
-                bits.extend_from_slice(&chunk[..n]);
-                left -= n as u64;
-            }
-            if remaining_bits != 0
-                && let Some(last) = bits.last_mut()
-            {
-                *last &= (1u8 << remaining_bits).wrapping_sub(1);
-            }
-            let index = PhysIndex::bitmap(page_offset, bits);
-            check_pages_fit(page_offset, index.len() as u64, len)?;
 
-            return Ok(index);
+        // Keep the bitmap, with a rank table, as the index. Read it in
+        // chunks so the allocation follows the bytes actually
+        // present in the file.
+        let mut bits = Vec::new();
+        let mut left = bitmap_size;
+        let mut chunk = vec![0u8; 0x1_0000];
+        while left > 0 {
+            let n = usize::try_from(left.min(chunk.len() as u64)).unwrap();
+            reader.read_exact(&mut chunk[..n])?;
+            bits.extend_from_slice(&chunk[..n]);
+            left -= n as u64;
         }
-        let mut physmem = PhysmemMap::new();
-
-        // Walk the bitmap byte per byte..
-        for bitmap_idx in 0..bitmap_size {
-            let mut byte = [0u8];
-            reader.read_exact(&mut byte)?;
-            // ..if this is the last byte, and we have a few more bits to read..
-            let last_byte = bitmap_idx == bitmap_size - 1;
-            if last_byte && remaining_bits != 0 {
-                // ..let's mask out the ones we don't care about.
-                let mask = (1u8 << remaining_bits).wrapping_sub(1);
-                byte[0] &= mask;
-            }
-
-            let byte = byte[0];
-            // Walk every bits.
-            for bit_idx in 0..8 {
-                // If it's not set, go to the next.
-                if byte.bit(bit_idx) == 0 {
-                    continue;
-                }
-
-                // Calculate where the page is.
-                let pa =
-                    gpa_from_bitmap(bitmap_idx, bit_idx).ok_or(Error::Overflow("pfn in bitmap"))?;
-
-                check_pages_fit(page_offset, 1, len)?;
-                let insert = physmem.insert(pa, page_offset);
-                debug_assert!(insert.is_none());
-                page_offset = page_offset
-                    .checked_add(PageKind::Normal.size())
-                    .ok_or(Error::BitmapPageOffsetOverflow(bitmap_idx, bit_idx))?;
-            }
+        if remaining_bits != 0
+            && let Some(last) = bits.last_mut()
+        {
+            *last &= (1u8 << remaining_bits).wrapping_sub(1);
+        }
+        let physidx = PhysIndex::bitmap(page_offset, bits);
+        // XXX:???
+        if !check_pages_fit(
+            page_offset,
+            NonZeroU64::new(physidx.pages_amount() as u64).unwrap(),
+            len,
+        ) {
+            return Err(Error::InvalidData("run doesn't fit"));
         }
 
-        Ok(PhysIndex::Eager(physmem))
+        Ok(physidx)
     }
 
-    /// Build the physical memory map for [`DumpType::KernelMemory`] /
+    /// Build the physical memory index for [`DumpType::KernelMemory`] /
     /// [`DumpType::KernelAndUserMemory`] and [`DumpType::CompleteMemory`] dump.
-    fn kernel_physmem(
-        dump_type: DumpType,
-        reader: &mut impl Reader,
-        strategy: PhysIndexStrategy,
-    ) -> Result<PhysIndex> {
+    fn kernel_physidx(dump_type: DumpType, reader: &mut impl Reader) -> Result<PhysIndex> {
         use DumpType as D;
         let mut page_count = 0u64;
         let (mut page_offset, metadata_size, total_number_of_pages) = match dump_type {
@@ -435,20 +370,19 @@ impl KernelDumpParser {
             return Err(Error::InvalidData("no first page or metadata size"));
         }
 
-        let pfn_range_size = mem::size_of::<PfnRange>();
+        let pfn_range_size = size_of::<PfnRange>();
         if (metadata_size % pfn_range_size as u64) != 0 {
             return Err(Error::InvalidData("metadata size is not a multiple of 8"));
         }
 
         let number_pfns = metadata_size / pfn_range_size as u64;
-        let len = reader_len(reader)?;
-        let mut physmem = Builder::new(strategy);
+        let reader_len = reader_len(reader)?;
+        let mut physmem = Builder::new();
 
         for _ in 0..number_pfns {
             if dump_type == D::CompleteMemory {
                 // `CompleteMemoryDump` type seems to be bound by the
-                // `total_number_of_pages` field, *not* by
-                // `metadata_size`.
+                // `total_number_of_pages` field, *not* by `metadata_size`.
                 if page_count == total_number_of_pages {
                     break;
                 }
@@ -463,40 +397,52 @@ impl KernelDumpParser {
                 break;
             }
 
-            if pfn_range.number_of_pages > 0 {
-                let gpa =
-                    gpa_from_pfn_range(&pfn_range, 0).ok_or(Error::Overflow("w/ pfn_range"))?;
-                gpa_from_pfn_range(&pfn_range, pfn_range.number_of_pages - 1)
-                    .ok_or(Error::Overflow("w/ pfn_range"))?;
+            let Some(number_of_pages) = NonZeroU64::new(pfn_range.number_of_pages) else {
+                return Err(Error::InvalidData("zero number_of_pages"));
+            };
 
-                // The range's pages must be in the file before they go in the
-                // index.
-                check_pages_fit(page_offset, pfn_range.number_of_pages, len)?;
-                let insert = physmem.push_run(gpa, pfn_range.number_of_pages, page_offset);
-                debug_assert!(insert);
-                page_offset += pfn_range.number_of_pages * PageKind::Normal.size();
+            // Guard against `number_of_pages` that would extend past the file.
+            if !check_pages_fit(page_offset, number_of_pages, reader_len) {
+                return Err(Error::InvalidData("run doesn't fit"));
             }
+
+            // Calculate the physical address of the first page..
+            let phys_addr = pfn_range
+                .first_page_phys_addr()
+                .ok_or(Error::InvalidData("overflow w/ pfn range first"))?;
+
+            // ..and make sure the end of the range doesn't overflow either.
+            pfn_range
+                .last_page_phys_addr()
+                .ok_or(Error::InvalidData("overflow w/ pfn range last"))?;
+
+            // This is looking sane so push the run into the index.
+            physmem.push_run(phys_addr, number_of_pages, page_offset);
+
+            // Move the page offset along.
+            page_offset += pfn_range
+                .total_len()
+                .ok_or(Error::InvalidData("overflow w/ page offset"))?;
 
             page_count = page_count
                 .checked_add(pfn_range.number_of_pages)
-                .ok_or(Error::Overflow("w/ page_count"))?;
+                .ok_or(Error::InvalidData("overflow w/ page_count"))?;
         }
 
         physmem.finish()
     }
 
-    fn build_physmem(
+    fn build_phyidx(
         dump_type: DumpType,
         headers: &Header64,
         reader: &mut impl Reader,
-        strategy: PhysIndexStrategy,
     ) -> Result<PhysIndex> {
         use DumpType as D;
         match dump_type {
-            D::Full => Self::full_physmem(headers, reader, strategy),
-            D::Bmp | D::LiveKernelMemory => Self::bmp_physmem(reader, strategy),
+            D::Full => Self::full_physindex(headers, reader),
+            D::Bmp | D::LiveKernelMemory => Self::bmp_physindex(reader),
             D::KernelMemory | D::KernelAndUserMemory | D::CompleteMemory => {
-                Self::kernel_physmem(dump_type, reader, strategy)
+                Self::kernel_physidx(dump_type, reader)
             }
         }
     }
