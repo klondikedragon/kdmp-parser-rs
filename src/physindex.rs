@@ -1,13 +1,8 @@
 //! Physical memory index: maps a page-aligned [`Gpa`] to the file offset where
-//! the content of that page lives.
-//!
-//! Two strategies are available:
-//! - [`PhysIndexStrategy::Eager`]: one map entry per page. Memory grows with
-//!   the number of pages in the dump.
-//! - [`PhysIndexStrategy::Compact`]: sorted runs of consecutive pages (full,
-//!   kernel and complete dumps) or the dump bitmap plus a rank table (bitmap
-//!   dumps). Memory grows with the number of runs or with the size of the
-//!   bitmap instead of with the number of pages.
+//! the content of that page lives. Sorted runs of consecutive pages (full,
+//! kernel and complete dumps) or the dump bitmap plus a rank table (bitmap
+//! dumps). Memory grows with the number of runs or with the size of the
+//! bitmap instead of with the number of pages.
 use std::num::NonZeroU64;
 use std::ops::Range;
 
