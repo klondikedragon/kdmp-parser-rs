@@ -19,7 +19,7 @@ use crate::structs::PageKind;
 /// Number of bits (pages) covered by one rank-table entry.
 const RANK_BLOCK_BITS: u64 = 4_096;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Run {
     first_pfn: Pfn,
     pages: u64,
@@ -88,7 +88,6 @@ impl Builder {
             file_offset,
         };
 
-        // XXX: Can we sort here directly?
         // Try to merge this page w/ the last run we added if it contiguous with
         // this page..
         if let Some(last) = self.runs.last_mut()
@@ -119,15 +118,37 @@ impl Builder {
         self.total_pages += pages;
     }
 
-    /// Finalizes the index. Overlapping runs are reported as duplicate
-    /// pages.
+    /// Finalizes the index.
     pub fn finish(mut self) -> Result<PhysIndex> {
-        self.runs.sort_by_key(|r| r.first_pfn);
+        // Sort the runs.. (we don't care if elements that are equal are
+        // re-ordered, so unstability is fine)..
+        self.runs.sort_unstable_by_key(|r| r.first_pfn);
+
+        // Detect duplicate gpas / overlaped runs..
         for [run, next_run] in self.runs.array_windows::<2>() {
             if run.pfn_range().end > next_run.pfn_range().start {
-                return Err(Error::DuplicateGpa(next_run.first_pfn.gpa()));
+                return Err(Error::InvalidData("duplicate gpa in phys index"));
             }
         }
+
+        // Merge every runs we can..
+        self.runs.dedup_by(|next, prev| {
+            // If `next` is contiguous after `p`, then let's merge `next` into
+            // `prev`..
+            if next.is_contiguous_after(prev) {
+                prev.pages += next.pages;
+
+                // ..and delete `next`.
+                true
+            }
+            // Otherwise keep both runs.
+            else {
+                false
+            }
+        });
+
+        // ..and shrink the vec.
+        self.runs.shrink_to_fit();
 
         Ok(PhysIndex::Runs {
             runs: self.runs,
@@ -298,3 +319,127 @@ impl Iterator for PhysIter<'_> {
 }
 
 impl ExactSizeIterator for PhysIter<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use crate::error::Error;
+    use crate::gxa::Gpa;
+    use crate::physindex::{Builder, PhysIndex, Run};
+
+    fn assert_runs(builder: Builder, expected: &[Run]) {
+        let PhysIndex::Runs { runs, total_pages } = builder.finish().unwrap() else {
+            panic!("expected a runs index");
+        };
+
+        assert_eq!(runs.len(), expected.len());
+        assert_eq!(total_pages, expected.iter().map(|e| e.pages).sum());
+
+        for (run, expected) in runs.iter().zip(expected) {
+            assert_eq!(run, expected);
+        }
+    }
+
+    fn run(gpa: u64, pages: u64, file_offset: u64) -> Run {
+        Run {
+            first_pfn: Gpa::new(gpa).pfn(),
+            pages,
+            file_offset,
+        }
+    }
+
+    fn builder(runs: &[Run]) -> Builder {
+        let mut builder = Builder::new();
+        for run in runs {
+            builder.push_run(
+                Gpa::from_pfn(run.first_pfn),
+                NonZeroU64::new(run.pages).unwrap(),
+                run.file_offset,
+            );
+        }
+
+        builder
+    }
+
+    #[test]
+    fn runs_empty_and_single_page() {
+        assert_runs(builder(&[]), &[]);
+
+        let builder = builder(&[run(0, 1, 0)]);
+
+        assert_runs(builder, &[run(0, 1, 0)]);
+    }
+
+    #[test]
+    fn runs_merge_runs() {
+        let builder = builder(&[
+            run(0x1_000, 1, 0),
+            run(0x2_000, 1, 0x1_000),
+            run(0x3_000, 3, 0x2_000),
+            run(0x6_000, 1, 0x5_000),
+        ]);
+
+        assert_runs(builder, &[run(0x1_000, 6, 0)]);
+    }
+
+    #[test]
+    fn runs_merge_out_of_order_runs() {
+        let builder = builder(&[
+            run(0x3_000, 2, 0x2_000),
+            run(0x1_000, 2, 0),
+            run(0x5_000, 2, 0x4_000),
+        ]);
+
+        assert_runs(builder, &[run(0x1_000, 6, 0)]);
+    }
+
+    #[test]
+    fn runs_sorts_runs_but_no_merge_across_gaps() {
+        let builder = builder(&[
+            run(0x4_000, 2, 0x5_000),
+            run(0x1_000, 2, 0),
+            // 0x1_000-0x2_000 are adjacent GPAs, but not in the offset space
+            // where's a gap of a page.
+            run(0x3_000, 1, 0x3_000),
+        ]);
+
+        assert_runs(builder, &[
+            run(0x1_000, 2, 0),
+            run(0x3_000, 1, 0x3_000),
+            run(0x4_000, 2, 0x5_000),
+        ]);
+    }
+
+    #[test]
+    fn runs_rejects_duplicates_and_overlaps() {
+        // Exact dup.
+        let exact_dup = [run(0x1_000, 1, 0), run(0x1_000, 1, 0)];
+        assert!(matches!(
+            builder(&exact_dup).finish(),
+            Err(Error::InvalidData(_))
+        ));
+
+        // First range fully includes the second one.
+        let mut full_inc = [run(0x1_000, 5, 0), run(0x2_000, 2, 0x1_000)];
+        assert!(matches!(
+            builder(&full_inc).finish(),
+            Err(Error::InvalidData(_))
+        ));
+
+        // Same as above but reversed order.
+        full_inc.reverse();
+        assert!(matches!(
+            builder(&full_inc).finish(),
+            Err(Error::InvalidData(_))
+        ));
+
+        // Partial overlap.
+        let partial_overlap = [run(0x1_000, 5, 0), run(0x5_000, 2, 0x1_000)];
+
+        assert!(matches!(
+            builder(&partial_overlap).finish(),
+            Err(Error::InvalidData(_))
+        ));
+    }
+}

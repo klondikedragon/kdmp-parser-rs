@@ -96,7 +96,6 @@ pub enum Error {
     Io(io::Error),
     InvalidData(&'static str),
     UnknownDumpType(u32),
-    DuplicateGpa(Gpa),
     InvalidSignature(u32),
     InvalidValidDump(u32),
     PhysAddrOverflow(u32, u64),
@@ -136,9 +135,6 @@ impl Display for Error {
             Self::Io(_) => write!(f, "io"),
             Self::InvalidData(i) => write!(f, "invalid data: {i}"),
             Self::UnknownDumpType(u) => write!(f, "unsupported dump type {u:#x}"),
-            Self::DuplicateGpa(gpa) => {
-                write!(f, "duplicate gpa found in physmem map for {gpa}")
-            }
             Self::InvalidSignature(sig) => write!(
                 f,
                 "header's signature looks wrong: {sig:#x} vs {DUMP_HEADER64_EXPECTED_SIGNATURE:#x}"
