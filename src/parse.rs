@@ -11,10 +11,12 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::Path;
 
+use crate::bits::Bits;
 use crate::error::{Error, Result};
 use crate::gxa::{Gpa, Gva};
 use crate::map::{MappedFileReader, Reader};
 use crate::physindex::{Builder, PhysIndex};
+use crate::pxe::Pfn;
 use crate::structs::{
     BmpHeader64, Context, DUMP_HEADER64_EXPECTED_SIGNATURE, DUMP_HEADER64_EXPECTED_VALID_DUMP,
     DumpType, ExceptionRecord64, FullRdmpHeader64, Header64, KdDebuggerData64, KernelRdmpHeader64,
@@ -24,6 +26,11 @@ use crate::virt;
 use crate::virt_utils::{
     ModuleMap, try_extract_kernel_modules, try_extract_user_modules, try_find_prcb,
 };
+
+/// Calculate the pfn from a bitmap & bit index.
+fn pfn_from_bitmap_idxs(bitmap_idx: u64, bit_idx: u64) -> Option<Pfn> {
+    Some(Pfn::new(bitmap_idx.checked_mul(8)?.checked_add(bit_idx)?))
+}
 
 /// Total length of the reader, leaving its position unchanged.
 fn reader_len(reader: &mut impl Reader) -> Result<u64> {
@@ -180,7 +187,7 @@ impl KernelDumpParser {
     }
 
     /// Get a list of every GPAs available in this dump.
-    pub fn gpas(&self) -> impl ExactSizeIterator<Item = Gpa> + '_ {
+    pub fn gpas(&self) -> impl ExactSizeIterator<Item = Gpa> {
         // We don't surface the offset to the user because they can't really do
         // anything w/ it (cf gh issue #16).
         self.physidx.iter().map(|(gpa, _)| gpa)
@@ -283,54 +290,98 @@ impl KernelDumpParser {
     }
 
     /// Build the physical memory index for a [`DumpType::Bmp`] dump.
+    ///
+    /// The way this scheme works is that there's a bitmap that tells you if a
+    /// PFN exists or not. There's also a `first_page` field that gives you the
+    /// file offset to the content of the first PFN. From there each bit
+    /// describes a PFN.
+    ///
+    /// Let's walk through an example to make the above crystal clear; consider
+    /// the below header:
+    ///   - Bmp header: pages: 137, first_page: 431
+    ///
+    /// From there, we can calculate the bitmap size in bytes; there's 1 page
+    /// per bit, so the bitmap size is round_above(137 / 8) = 18 bytes. But
+    /// notice that although the bitmap is 18 bytes long, not all bits off the
+    /// last byte should be looked at: 136 / 8 = 17, so we basically need 1 bit
+    /// off that last byte (137 % 8).
+    ///
+    /// And then it's just a matter of computing a pfn from a byte & a bit
+    /// index: `((byte_idx * 8) + bit_idx)`. And for every bit, you can move
+    /// the file offset by a page.
+    ///
+    /// If the bit is 0, the PFN isn't in the file. In that case you don't move
+    /// the file offset (otherwise you'd have to embed a full page of 0's for
+    /// every "holes").
     fn bmp_physindex(reader: &mut impl Reader) -> Result<PhysIndex> {
         let bmp_header = read_struct::<BmpHeader64>(reader)?;
         if !bmp_header.looks_good() {
             return Err(Error::InvalidData("bmp header doesn't look right"));
         }
 
-        let remaining_bits = bmp_header.pages % 8;
-        let bitmap_size = bmp_header.pages.div_ceil(8);
-        let page_offset = bmp_header.first_page;
-        let len = reader_len(reader)?;
+        let Some(total_pages) = NonZeroU64::new(bmp_header.total_present_pages) else {
+            return Err(Error::InvalidData("bmp has 0 total pages"));
+        };
+
+        let Some(pages) = NonZeroU64::new(bmp_header.pages) else {
+            return Err(Error::InvalidData("bmp has 0 pages"));
+        };
+
+        // Make sure the bitmap doesn't extend past the dump file's end..
+        let reader_len = reader_len(reader)?;
+        let bitmap_size = pages.get().div_ceil(8);
         if reader
             .stream_position()?
             .checked_add(bitmap_size)
-            .is_none_or(|end| end > len)
+            .is_none_or(|end| end > reader_len)
         {
             return Err(Error::InvalidData(
                 "bitmap extends past the end of the file",
             ));
         }
 
-        // Keep the bitmap, with a rank table, as the index. Read it in
-        // chunks so the allocation follows the bytes actually
-        // present in the file.
-        let mut bits = Vec::new();
-        let mut left = bitmap_size;
-        let mut chunk = vec![0u8; 0x1_0000];
-        while left > 0 {
-            let n = usize::try_from(left.min(chunk.len() as u64)).unwrap();
-            reader.read_exact(&mut chunk[..n])?;
-            bits.extend_from_slice(&chunk[..n]);
-            left -= n as u64;
-        }
-        if remaining_bits != 0
-            && let Some(last) = bits.last_mut()
-        {
-            *last &= (1u8 << remaining_bits).wrapping_sub(1);
-        }
-        let physidx = PhysIndex::bitmap(page_offset, bits);
-        // XXX:???
-        if !check_pages_fit(
-            page_offset,
-            NonZeroU64::new(physidx.pages_amount() as u64).unwrap(),
-            len,
-        ) {
-            return Err(Error::InvalidData("run doesn't fit"));
+        // ..also check that the number of pages described fit in the file.
+        let remaining_bits = pages.get() % 8;
+        let mut page_offset = bmp_header.first_page;
+        if !check_pages_fit(page_offset, total_pages, reader_len) {
+            return Err(Error::InvalidData("bitmap doesn't fit"));
         }
 
-        Ok(physidx)
+        // Walk the bitmap byte per byte..
+        let mut physidx = Builder::new();
+        for bitmap_idx in 0..bitmap_size {
+            let mut byte = [0u8];
+            reader.read_exact(&mut byte)?;
+            // ..if this is the last byte, and we have a few more bits to read..
+            let last_byte = bitmap_idx == bitmap_size - 1;
+            if last_byte && remaining_bits != 0 {
+                // ..let's mask out the ones we don't care about.
+                let mask = (1u8 << remaining_bits).wrapping_sub(1);
+                byte[0] &= mask;
+            }
+
+            // Walk every bits.
+            for bit_idx in 0u64..8 {
+                // If it's not set, go to the next.
+                if byte[0].bit(bit_idx.try_into().unwrap()) == 0 {
+                    continue;
+                }
+
+                // Calculate the PFN..
+                let pfn = pfn_from_bitmap_idxs(bitmap_idx, bit_idx)
+                    .ok_or(Error::InvalidData("malformed bitmap"))?;
+
+                // .. and feed it to the index.
+                physidx.push(pfn.gpa(), page_offset);
+
+                // Move the file offset along.
+                page_offset = page_offset
+                    .checked_add(PageKind::Normal.len())
+                    .ok_or(Error::InvalidData("malformed bitmap"))?;
+            }
+        }
+
+        physidx.finish()
     }
 
     /// Build the physical memory index for [`DumpType::KernelMemory`] /

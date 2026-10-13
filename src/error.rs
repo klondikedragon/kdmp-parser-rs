@@ -98,9 +98,6 @@ pub enum Error {
     UnknownDumpType(u32),
     InvalidSignature(u32),
     InvalidValidDump(u32),
-    PhysAddrOverflow(u32, u64),
-    PageOffsetOverflow(u32, u64),
-    BitmapPageOffsetOverflow(u64, usize),
     PartialRead {
         expected_amount: usize,
         actual_amount: usize,
@@ -142,16 +139,6 @@ impl Display for Error {
             Self::InvalidValidDump(dump) => write!(
                 f,
                 "header's valid dump looks wrong: {dump:#x} vs {DUMP_HEADER64_EXPECTED_VALID_DUMP:#x}"
-            ),
-            Self::PhysAddrOverflow(run, page) => {
-                write!(f, "overflow for phys addr w/ run {run} page {page}")
-            }
-            Self::PageOffsetOverflow(run, page) => {
-                write!(f, "overflow for page offset w/ run {run} page {page}")
-            }
-            Self::BitmapPageOffsetOverflow(bitmap_idx, bit_idx) => write!(
-                f,
-                "overflow for page offset w/ bitmap_idx {bitmap_idx} bit_idx {bit_idx}"
             ),
             Self::PartialRead {
                 expected_amount,
