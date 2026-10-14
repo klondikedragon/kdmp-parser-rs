@@ -60,7 +60,7 @@ pub type ModuleMap = HashMap<Range<Gva>, String>;
 /// Upper bound on the entries walked in one module list. Real lists hold a few
 /// hundred entries; a corrupted list can be cyclic without returning to the
 /// head.
-const MAX_MODULE_LIST_ENTRIES: usize = 0x1_0000;
+const MAX_MODULE_LIST_ENTRIES: usize = 0x1_000;
 
 /// Walk a `LIST_ENTRY` of `LdrDataTableEntry`. It is used to dump both the user
 /// & driver / module lists.
@@ -79,7 +79,8 @@ fn try_read_module_map<P: Pod + HasCheckedAdd>(
     while entry_addr != head {
         // A corrupted list can loop without coming back to the head; treat it
         // like an unreadable entry.
-        if !visited.insert(entry_addr) || visited.len() > MAX_MODULE_LIST_ENTRIES {
+        let added = visited.insert(entry_addr);
+        if !added || visited.len() >= MAX_MODULE_LIST_ENTRIES {
             return Ok(None);
         }
 
