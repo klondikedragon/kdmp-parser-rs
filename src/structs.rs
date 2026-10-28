@@ -469,16 +469,15 @@ impl RdmpHeader64 {
             return false;
         }
 
-        // Both fields come from the file, so a small value must not underflow.
-        match (
-            self.metadata_size.checked_sub(0x20),
-            self.first_page_offset.checked_sub(0x20_40),
-        ) {
-            (Some(metadata), Some(first_page)) if metadata == first_page => {}
-            _ => return false,
+        // Make sure that the values don't underflow.
+        if let Some(metadata) = self.metadata_size.checked_sub(0x20)
+            && let Some(first_page) = self.first_page_offset.checked_sub(0x20_40)
+            && metadata == first_page
+        {
+            true
+        } else {
+            false
         }
-
-        true
     }
 }
 
