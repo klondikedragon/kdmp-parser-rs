@@ -1,10 +1,9 @@
 // Axel '0vercl0k' Souchet - March 17 2024
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Cursor, SeekFrom};
+use std::io::{Cursor, Read, SeekFrom};
 use std::ops::Range;
 use std::path::PathBuf;
-use std::slice::from_raw_parts;
 use std::sync::LazyLock;
 use std::{env, fs};
 
@@ -13,7 +12,8 @@ use kdmp_parser::gxa::{Gpa, Gva};
 use kdmp_parser::parse::KernelDumpParser;
 use kdmp_parser::structs::{
     BMPHEADER64_EXPECTED_SIGNATURE, BMPHEADER64_EXPECTED_VALID_DUMP, BmpHeader64, DumpType,
-    PageKind,
+    Header64, KernelRdmpHeader64, PageKind, PfnRange, Pod, RDMP_HEADER64_EXPECTED_MARKER,
+    RDMP_HEADER64_EXPECTED_SIGNATURE, RDMP_HEADER64_EXPECTED_VALID_DUMP, RdmpHeader64,
 };
 use kdmp_parser::{phys, virt};
 use serde::Deserialize;
@@ -848,12 +848,28 @@ fn partial_phys() {
     ));
 }
 
-/// Builds a dump from the first page of a real dump with a different dump type
-/// and whatever follows the header.
+fn pod_mut<T: Pod>(bytes: &mut [u8]) -> Option<&mut T> {
+    if bytes.len() < size_of::<T>() {
+        return None;
+    }
+
+    let ptr = bytes.as_mut_ptr().cast::<T>();
+
+    if !ptr.is_aligned() {
+        return None;
+    }
+
+    Some(unsafe { &mut *ptr })
+}
+
+/// Builds a dump from the [`Header64`] of a real dump, but change the dump type
+/// and add a tail to that.
 fn synthetic_dump(dump_type: DumpType, patch: impl Fn(&mut [u8]), tail: &[u8]) -> Vec<u8> {
-    let mut data = fs::read(BMP_PATH.as_path()).unwrap();
-    data.truncate(0x2_000);
-    data[0xf98..0xf9c].copy_from_slice(&(dump_type as u32).to_le_bytes());
+    let mut f = File::open(BMP_PATH.as_path()).unwrap();
+    let mut data = vec![0; size_of::<Header64>()];
+    f.read_exact(&mut data).unwrap();
+
+    pod_mut::<Header64>(&mut data).unwrap().dump_type = dump_type as u32;
     patch(&mut data);
     data.extend_from_slice(tail);
 
@@ -863,18 +879,15 @@ fn synthetic_dump(dump_type: DumpType, patch: impl Fn(&mut [u8]), tail: &[u8]) -
 #[test]
 fn header_counts_checked_against_file_length() {
     let bmp_header = |pages: u64, first_page: u64| {
-        let mut h = BmpHeader64::default();
+        let mut data = vec![0; size_of::<BmpHeader64>()];
+        let h = pod_mut::<BmpHeader64>(&mut data).unwrap();
         h.signature = BMPHEADER64_EXPECTED_SIGNATURE;
         h.valid_dump = BMPHEADER64_EXPECTED_VALID_DUMP;
         h.first_page = first_page;
         h.total_present_pages = pages;
         h.pages = pages;
 
-        let slice_over_h = unsafe { from_raw_parts((&raw const h).cast::<u8>(), size_of_val(&h)) };
-        let mut v = vec![0; slice_over_h.len()];
-        v.copy_from_slice(slice_over_h);
-
-        v
+        data
     };
 
     let cases = [
@@ -907,14 +920,24 @@ fn header_counts_checked_against_file_length() {
         ),
         // Kernel dump with a range of 2^36 pages.
         synthetic_dump(DumpType::KernelMemory, |_| {}, &{
-            let mut r = vec![0u8; 0x1_000];
-            r[0..4].copy_from_slice(&0x40u32.to_le_bytes());
-            r[4..8].copy_from_slice(b"RDMP");
-            r[8..12].copy_from_slice(b"DUMP");
-            r[0x10..0x18].copy_from_slice(&0x30u64.to_le_bytes());
-            r[0x18..0x20].copy_from_slice(&0x2_050u64.to_le_bytes());
-            r[0x30..0x38].copy_from_slice(&1u64.to_le_bytes());
-            r[0x38..0x40].copy_from_slice(&(1u64 << 36).to_le_bytes());
+            #[repr(C)]
+            struct Synthetic {
+                hdr: RdmpHeader64,
+                range: PfnRange,
+            }
+
+            unsafe impl Pod for Synthetic {}
+
+            let mut r = vec![0u8; size_of::<Synthetic>()];
+            let d = pod_mut::<Synthetic>(&mut r).unwrap();
+            d.hdr.marker = RDMP_HEADER64_EXPECTED_MARKER;
+            d.hdr.signature = RDMP_HEADER64_EXPECTED_SIGNATURE;
+            d.hdr.valid_dump = RDMP_HEADER64_EXPECTED_VALID_DUMP;
+            d.hdr.metadata_size = 0x30;
+            d.hdr.first_page_offset = 0x2_050;
+            d.range.number_of_pages = 1;
+            d.range.page_file_number = 1 << 36;
+
             r
         }),
     ];
@@ -949,15 +972,15 @@ fn cyclic_module_list_is_dropped() {
 
 #[test]
 fn small_rdmp_sizes_do_not_underflow() {
-    // A metadata size below 0x20 used to underflow in
-    // `RdmpHeader64::looks_good`.
-    let mut rdmp = vec![0u8; 0x1_000];
-    rdmp[0..4].copy_from_slice(&0x40u32.to_le_bytes());
-    rdmp[4..8].copy_from_slice(b"RDMP");
-    rdmp[8..12].copy_from_slice(b"DUMP");
-    rdmp[0x10..0x18].copy_from_slice(&0x10u64.to_le_bytes());
-    rdmp[0x18..0x20].copy_from_slice(&0x10u64.to_le_bytes());
-    let data = synthetic_dump(DumpType::KernelMemory, |_| {}, &rdmp);
+    let mut data = vec![0; size_of::<KernelRdmpHeader64>()];
+    let h = pod_mut::<KernelRdmpHeader64>(&mut data).unwrap();
+    h.hdr.marker = RDMP_HEADER64_EXPECTED_MARKER;
+    h.hdr.signature = RDMP_HEADER64_EXPECTED_SIGNATURE;
+    h.hdr.valid_dump = RDMP_HEADER64_EXPECTED_VALID_DUMP;
+    // See [`RdmpHeader64::looks_good`].
+    h.hdr.metadata_size = 0x20 - 1;
+    h.hdr.first_page_offset = 0x20_40 - 1;
+    let data = synthetic_dump(DumpType::KernelMemory, |_| {}, &data);
 
     assert!(matches!(
         KernelDumpParser::with_reader(Cursor::new(data)),

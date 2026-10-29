@@ -438,9 +438,9 @@ impl Debug for Context {
     }
 }
 
-const RDMP_HEADER64_EXPECTED_MARKER: u32 = 0x40;
-const RDMP_HEADER64_EXPECTED_SIGNATURE: u32 = 0x50_4D_44_52; // 'PMDR'
-const RDMP_HEADER64_EXPECTED_VALID_DUMP: u32 = 0x50_4D_55_44; // 'PMUD'
+pub const RDMP_HEADER64_EXPECTED_MARKER: u32 = 0x40;
+pub const RDMP_HEADER64_EXPECTED_SIGNATURE: u32 = 0x50_4D_44_52; // 'PMDR'
+pub const RDMP_HEADER64_EXPECTED_VALID_DUMP: u32 = 0x50_4D_55_44; // 'PMUD'
 
 #[repr(C)]
 #[derive(Debug, Default)]
@@ -480,6 +480,8 @@ impl RdmpHeader64 {
         }
     }
 }
+
+unsafe impl Pod for RdmpHeader64 {}
 
 #[repr(C)]
 #[derive(Debug, Default)]
